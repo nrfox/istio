@@ -446,10 +446,12 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
 		return buildEmptyClusterLoadAssignment(b.clusterName)
 	}
 
-	// features.EnableIngressWaypointRouting only makes sense for ingress gateways and for E/W gateways
-	// we don't want this behavior, so additionally check that we are not generating endpoints for the
-	// E/W gateway.
-	if features.EnableIngressWaypointRouting && !isEastWestGateway(b.proxy) {
+	// Sidecars can call service waypoints after applying outbound traffic policy:
+	// their CONNECT marker tells the waypoint not to repeat that traffic policy.
+	// Keep ingress opt-in separate, and leave east-west gateway dispatch unchanged.
+	sidecarToWaypoint := b.nodeType == model.SidecarProxy && features.EnableHBONESend &&
+		!bool(b.proxy.Metadata.DisableHBONESend) && !b.proxy.IsProxylessGrpc()
+	if (sidecarToWaypoint || features.EnableIngressWaypointRouting) && !isEastWestGateway(b.proxy) {
 		if waypointEps, f := b.findServiceWaypoint(endpointIndex); f {
 			// endpoints are from waypoint service but the envoy endpoint is different envoy cluster
 			locLbEps := b.generate(waypointEps, true)
@@ -841,18 +843,9 @@ func buildEnvoyLbEndpoint(b *EndpointBuilder, e *model.IstioEndpoint, mtlsEnable
 			address = serviceVIPs[0]
 			port = b.port
 		}
-		// We intentionally do not take into account waypoints here.
-		// 1. Workload waypoints: sidecar/ingress do not support sending traffic directly to workloads, only to services,
-		//    so these are not applicable.
-		// 2. Service waypoints: in ztunnel, we would defer handling service traffic if the service has a waypoint, and instead
-		//    send to the waypoint. However, with sidecars this is problematic. We don't know which service is the intended destination
-		//    until *after* we apply policies. If we then sent to a service waypoint, we apply service policies twice.
-		//    This can be problematic: double mirroring, fault injection, request manipulation, ....
-		//    Instead, we consider this to workload traffic. This gives the same behavior as if we were an application doing internal load balancing
-		//    with ztunnel.
-		//    Note: there is a pretty valid case for wanting to send to the service from ingress. This gives a two tier delegation.
-		//    However, it's not safe to do that by default; perhaps a future API could opt into this.
-		// Support connecting to server side waypoint proxy, if the destination has one. This is for sidecars and ingress.
+		// Service-waypoint selection happens before endpoint generation. Preserve the
+		// service VIP as the CONNECT authority and use the waypoint as the tunnel
+		// destination. Workload-waypoint selection is not performed here.
 		// Setup tunnel metadata so requests will go through the tunnel
 		target := ptr.NonEmptyOrDefault(waypoint, net.JoinHostPort(address, strconv.Itoa(port)))
 		innerAddressName := connectOriginate
@@ -1020,9 +1013,12 @@ func getSubSetLabels(dr *v1alpha3.DestinationRule, subsetName string) labels.Ins
 // For services that have a waypoint, we want to send to the waypoints rather than the service endpoints.
 // Lookup the service, find its waypoint, then find the waypoint's endpoints.
 func (b *EndpointBuilder) findServiceWaypoint(endpointIndex *model.EndpointIndex) ([]*model.IstioEndpoint, bool) {
-	// Currently we only support routers (gateways)
-	if b.nodeType != model.Router && !isEastWestGateway(b.proxy) {
-		// Currently only ingress and e/w gateway will call waypoints
+	if b.nodeType == model.SidecarProxy {
+		if !features.EnableHBONESend || bool(b.proxy.Metadata.DisableHBONESend) || b.proxy.IsProxylessGrpc() {
+			return nil, false
+		}
+	} else if b.nodeType != model.Router && !isEastWestGateway(b.proxy) {
+		// Waypoints must not route back through themselves.
 		return nil, false
 	}
 	if !b.service.HasAddressOrAssigned(b.proxy.Metadata.ClusterID) {
@@ -1040,10 +1036,10 @@ func (b *EndpointBuilder) findServiceWaypoint(endpointIndex *model.EndpointIndex
 	}
 	svc := svcs[0]
 	// They need to explicitly opt-in on the service to send from ingress -> waypoint
-	if !svc.IngressUseWaypoint && !isEastWestGateway(b.proxy) {
+	if b.nodeType != model.SidecarProxy && !svc.IngressUseWaypoint && !isEastWestGateway(b.proxy) {
 		return nil, false
 	}
-	// Weighted waypoints override the single primary waypoint for gateway endpoint generation.
+	// Weighted waypoints override the single primary waypoint for endpoint generation.
 	if len(svc.WeightedWaypoints) > 0 {
 		return b.weightedWaypointEndpoints(svc, endpointIndex)
 	}

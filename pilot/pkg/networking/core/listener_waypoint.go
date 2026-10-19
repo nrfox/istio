@@ -34,7 +34,9 @@ import (
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	celformatter "github.com/envoyproxy/go-control-plane/envoy/extensions/formatter/cel/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	googleproto "google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -282,12 +284,15 @@ func (lb *ListenerBuilder) buildHCMConnectTerminateChain(routes []*route.Route) 
 	// TODO: Remove in 1.32
 	pre1_29_2 := !lb.node.VersionGreaterOrEqual(&model.IstioVersion{Major: 1, Minor: 29, Patch: 2})
 	connectAuthorityFilter := xdsfilters.ConnectAuthorityFilter
+	trafficPolicyFilter := xdsfilters.TrafficPolicyFilter
 	if pre1_29_2 {
 		connectAuthorityFilter = xdsfilters.ConnectAuthorityFilterPre1_29_2
+		trafficPolicyFilter = xdsfilters.TrafficPolicyFilterPre1_29_2
 	}
 	filters = append(filters,
 		xdsfilters.GenerateWaypointDownstreamMetadataFilter(),
-		connectAuthorityFilter)
+		connectAuthorityFilter,
+		trafficPolicyFilter)
 
 	// This filter checks whether the request went through a waypoint already and thefore whether L7 policies have
 	// been applied already. We put that information into filter state for later use when we decide whether to
@@ -846,6 +851,17 @@ func buildConnectForwarder(push *model.PushContext, proxy *model.Proxy, class is
 		}
 		filters = []*listener.Filter{xdsfilters.WaypointListenerBaggagePeerMetadata}
 	}
+	// Sidecars have already applied outbound HTTP traffic policy. Waypoints and
+	// gateways must not assert this marker merely because they originate a tunnel.
+	if tunnel && proxy.Type == model.SidecarProxy {
+		tcpProxy.TunnelingConfig.HeadersToAdd = append(tcpProxy.TunnelingConfig.HeadersToAdd, &core.HeaderValueOption{
+			AppendAction: core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			Header: &core.HeaderValue{
+				Key:   xdsfilters.TrafficPolicyHeader,
+				Value: "omit-l7-traffic-policies",
+			},
+		})
+	}
 
 	tcp := &listener.Filter{
 		Name: wellknown.TCPProxy,
@@ -1152,6 +1168,41 @@ func buildRouteVHostDomains(svc *model.Service) []string {
 }
 
 func buildWaypointInboundHTTPRouteConfig(lb *ListenerBuilder, svc *model.Service, cc inboundChainConfig) *route.RouteConfiguration {
+	rc := buildWaypointInboundHTTPRouteConfigNormal(lb, svc, cc)
+	for _, vh := range rc.VirtualHosts {
+		// Only the outer CONNECT filter can populate this marker. Do not match an
+		// application header: it must not let an individual request select this path.
+		// Keep the same HCM and service-scoped authn/authz filters for both paths.
+		direct := &route.Route{
+			Name: "traffic-policy-already-applied",
+			Match: &route.RouteMatch{
+				PathSpecifier: &route.RouteMatch_Prefix{Prefix: "/"},
+				FilterState: []*matcherv3.FilterStateMatcher{{
+					Key: xdsfilters.TrafficPolicyFilterStateKey,
+					Matcher: &matcherv3.FilterStateMatcher_StringMatch{
+						StringMatch: &matcherv3.StringMatcher{
+							MatchPattern: &matcherv3.StringMatcher_Exact{Exact: "omit-l7-traffic-policies"},
+						},
+					},
+				}},
+			},
+			Action: &route.Route_Route{Route: &route.RouteAction{
+				ClusterSpecifier: &route.RouteAction_Cluster{Cluster: cc.clusterName},
+				// Do not introduce another request timeout or retry at this hop.
+				Timeout: durationpb.New(0),
+			}},
+			TypedPerFilterConfig: map[string]*anypb.Any{
+				wellknown.Fault: protoconv.MessageToAny(&route.FilterConfig{Disabled: true}),
+				wellknown.CORS:  protoconv.MessageToAny(&route.FilterConfig{Disabled: true}),
+			},
+		}
+		vh.Routes = append([]*route.Route{direct}, vh.Routes...)
+	}
+	return rc
+}
+
+// buildWaypointInboundHTTPRouteConfigNormal builds the unchanged traffic-policy path.
+func buildWaypointInboundHTTPRouteConfigNormal(lb *ListenerBuilder, svc *model.Service, cc inboundChainConfig) *route.RouteConfiguration {
 	// TODO: Policy binding via VIP+Host is inapplicable for direct pod access.
 	if svc == nil {
 		return buildSidecarInboundHTTPRouteConfig(svc, lb, cc)

@@ -137,6 +137,12 @@ func (configgen *ConfigGeneratorImpl) BuildListeners(node *model.Proxy,
 		}
 		l = append(l, buildConnectOriginateListener(push, node, class))
 	}
+	// Waypoints and gateways add these in their respective listener builders.
+	if node.Type == model.SidecarProxy && model.ShouldCreateDoubleHBONEResources(node) {
+		l = append(l,
+			buildInnerConnectOriginateListener(push, node),
+			buildOuterConnectOriginateListener(push, node))
+	}
 
 	return l
 }
@@ -1513,7 +1519,7 @@ type listenerKey struct {
 	port int
 }
 
-// buildInnerConnectOriginateListener creates configuration for the waypoint inner_connect_originate listener.
+// buildInnerConnectOriginateListener creates configuration for the inner_connect_originate listener.
 // This listener together with the corresponding cluster is responsible for the creating the inner HBONE tunnel of the
 // double-HBONE connection needed to communicate across networks in ambient mode.
 //
@@ -1588,6 +1594,19 @@ func buildInnerConnectOriginateListener(push *model.PushContext, proxy *model.Pr
 			},
 		})
 	}
+	// The east-west gateway terminates only the outer tunnel. Put the traffic
+	// policy marker on the inner CONNECT so the destination waypoint receives it
+	// without bypassing its authentication/authorization or relying on the gateway
+	// to copy headers. The outer source remains "sidecar", not "waypoint".
+	if proxy.Type == model.SidecarProxy {
+		headers = append(headers, &core.HeaderValueOption{
+			AppendAction: core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			Header: &core.HeaderValue{
+				Key:   xdsfilters.TrafficPolicyHeader,
+				Value: "omit-l7-traffic-policies",
+			},
+		})
+	}
 	tunnel.HeadersToAdd = headers
 
 	tcpProxy := &tcp.TcpProxy{
@@ -1626,7 +1645,7 @@ func buildInnerConnectOriginateListener(push *model.PushContext, proxy *model.Pr
 	return l
 }
 
-// buildOuterConnectOriginateListener creates configuration for the waypoint outer_connect_originate listener.
+// buildOuterConnectOriginateListener creates configuration for the outer_connect_originate listener.
 // This listener together with the corresponding cluster is responsible for the creating the outer HBONE tunnel of the
 // double-HBONE connection needed to communicate across networks in ambient mode.
 //

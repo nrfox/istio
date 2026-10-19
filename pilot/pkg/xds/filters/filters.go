@@ -85,6 +85,12 @@ const (
 	// for incoming HBONE connections. This header when set to waypoint indicates that request has been processed
 	// by a waypoint already and therfore L7 policies have been applied already and we should skip them.
 	RequestSourceFilterStateKey = "io.istio.source"
+
+	// TrafficPolicyHeader carries the sender's traffic-policy marker on the outer HBONE CONNECT request.
+	TrafficPolicyHeader = "x-istio-traffic-policy"
+	// TrafficPolicyFilterStateKey stores the marker for the inner stream. It is a peer assertion,
+	// not an authorization decision; capturing it does not bypass authentication or authorization.
+	TrafficPolicyFilterStateKey = "io.istio.traffic_policy"
 )
 
 // Define static filters to be reused across the codebase. This avoids duplicate marshaling/unmarshaling
@@ -255,6 +261,12 @@ var (
 			}),
 		},
 	}
+
+	// TrafficPolicyFilter captures the outer CONNECT marker without changing policy enforcement.
+	// Share it with the inner stream in the same way as the CONNECT authority and request source.
+	TrafficPolicyFilter = buildTrafficPolicyFilter("istio.hashable_string")
+	// TODO: Remove in 1.32, along with the other pre-1.29.2 filter variants.
+	TrafficPolicyFilterPre1_29_2 = buildTrafficPolicyFilter("envoy.string")
 
 	ConnectAuthorityFilter = &hcm.HttpFilter{
 		Name: "connect_authority",
@@ -578,6 +590,32 @@ var routers = func() map[RouterFilterContext]*hcm.HttpFilter {
 	}
 	return res
 }()
+
+func buildTrafficPolicyFilter(factoryKey string) *hcm.HttpFilter {
+	return &hcm.HttpFilter{
+		Name: "traffic_policy",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: protoconv.MessageToAny(&sfs.Config{
+				OnRequestHeaders: []*sfsvalue.FilterStateValue{{
+					Key: &sfsvalue.FilterStateValue_ObjectKey{ObjectKey: TrafficPolicyFilterStateKey},
+					Value: &sfsvalue.FilterStateValue_FormatString{
+						FormatString: &core.SubstitutionFormatString{
+							Format: &core.SubstitutionFormatString_TextFormatSource{
+								TextFormatSource: &core.DataSource{
+									Specifier: &core.DataSource_InlineString{
+										InlineString: "%REQ(" + TrafficPolicyHeader + ")%",
+									},
+								},
+							},
+						},
+					},
+					FactoryKey:         factoryKey,
+					SharedWithUpstream: sfsvalue.FilterStateValue_ONCE,
+				}},
+			}),
+		},
+	}
+}
 
 func BuildRouterFilter(ctx RouterFilterContext) *hcm.HttpFilter {
 	return routers[ctx]

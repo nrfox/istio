@@ -65,9 +65,10 @@ func (b *EndpointBuilder) EndpointsByNetworkFilter(endpoints []*LocalityEndpoint
 	// generate EDS endpoints for remote networks, so that's why the logic between ambient and sidecar mode here
 	// is different.
 
-	// If we don't have multiple networks, we just return the plain endpoints. Otherwise we only return plain
-	// endpoints when ambient multi network is disabled or it's a sidecar proxy.
-	if !b.gateways().IsMultiNetworkEnabled() && (!features.EnableAmbientMultiNetwork || isSidecarProxy(b.proxy)) {
+	// In ambient multi-network, even sidecars must filter remote HBONE
+	// endpoints when no east-west gateway is available. Legacy non-HBONE
+	// endpoints retain the directly reachable fallback below.
+	if !b.gateways().IsMultiNetworkEnabled() && !features.EnableAmbientMultiNetwork {
 		// Multi-network is not configured (this is the case by default). Just access all endpoints directly.
 		return endpoints
 	}
@@ -163,11 +164,10 @@ func (b *EndpointBuilder) EndpointsByNetworkFilter(endpoints []*LocalityEndpoint
 			// reasons we cannot use double-HBONE. Skip this endpoint all together and log a
 			// warning to indicate that we did that.
 			//
-			// We cannot don't support double-HBONE when one of the following is true:
-			// - Ambient multi-network disabled all together
-			// - this proxy is a sidecar proxy - sidecars don't support double-HBONE yet
-			// - HBONE disabled via a feature flag
-			disableHBONE := !features.EnableAmbientMultiNetwork || isSidecarProxy(b.proxy) || bool(b.proxy.Metadata.DisableHBONESend)
+			// Sidecars require the same HBONE send and resource-generation gates
+			// as CDS/LDS. Do not emit an internal endpoint without its listeners.
+			disableHBONE := !features.EnableAmbientMultiNetwork || bool(b.proxy.Metadata.DisableHBONESend) ||
+				(isSidecarProxy(b.proxy) && !model.ShouldCreateDoubleHBONEResources(b.proxy))
 			if requireHBONE && disableHBONE {
 				log.Warnf("Workload %s on network %s requires using HBONE, but double-HBONE is not supported by this proxy, skipping",
 					istioEndpoint.WorkloadName, epNetwork)

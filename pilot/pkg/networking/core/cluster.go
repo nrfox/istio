@@ -339,6 +339,13 @@ func (configgen *ConfigGeneratorImpl) buildClusters(proxy *model.Proxy, req *mod
 		if proxy.EnableHBONEListen() {
 			clusters = append(clusters, configgen.buildInboundHBONEClusters())
 		}
+		// Outbound HBONE to a remote network needs both tunnel layers, even
+		// when the sidecar does not listen for inbound HBONE.
+		if model.ShouldCreateDoubleHBONEResources(proxy) {
+			clusters = append(clusters,
+				cb.buildInnerConnectOriginateCluster(proxy, req.Push),
+				cb.buildOuterConnectOriginateCluster(proxy, req.Push))
+		}
 		// Pass through clusters for inbound traffic. These cluster bind loopback-ish src address to access node local service.
 		clusters = inboundPatcher.conditionallyAppend(clusters, nil, cb.buildInboundPassthroughCluster())
 		clusters = append(clusters, inboundPatcher.insertedClusters()...)
