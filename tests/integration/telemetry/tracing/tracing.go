@@ -123,12 +123,26 @@ func TestSetup(ctx resource.Context) (err error) {
 	client = servicePrefix("client").GetMatches(echos)
 	server = match.ServiceName(echo.NamespacedName{Name: "server", Namespace: appNsInst}).GetMatches(echos)
 	ingInst = ist.IngressFor(ctx.Clusters().Default())
-	addrs, _ := ingInst.HTTPAddresses()
-	zipkinInst, err = zipkin.New(ctx, zipkin.Config{Cluster: ctx.Clusters().Default(), IngressAddr: addrs[0]})
+	ingressAddr, err := ingressHTTPAddress(ingInst)
+	if err != nil {
+		return err
+	}
+	zipkinInst, err = zipkin.New(ctx, zipkin.Config{Cluster: ctx.Clusters().Default(), IngressAddr: ingressAddr})
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+// ingressHTTPAddress returns the first external HTTP address of the ingress gateway, or an error
+// if no address could be resolved.
+func ingressHTTPAddress(ing ingress.Instance) (string, error) {
+	addrs, _ := ing.HTTPAddresses()
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("no HTTP address found for ingress %s/%s in cluster %s",
+			ing.Namespace(), ing.ServiceName(), ing.Cluster().Name())
+	}
+	return addrs[0], nil
 }
 
 // isNonGatewayRoot returns true if this span is a root (no parent) and is not from a gateway.
