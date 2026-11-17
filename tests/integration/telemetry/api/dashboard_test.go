@@ -310,9 +310,6 @@ func setupDashboardTest(done <-chan struct{}) {
 			times++
 			scopes.Framework.Infof("sending traffic %v", times)
 			for _, ing := range ingr {
-				hosts, ports := ing.TCPAddresses()
-				host := hosts[0]
-				port := ports[0]
 				_, err := ing.Call(echo.CallOptions{
 					Port: echo.Port{
 						Protocol: protocol.HTTP,
@@ -332,6 +329,15 @@ func setupDashboardTest(done <-chan struct{}) {
 					// These calls are not under tests, the dashboards are, so we can be leniant here
 					log.Warnf("requests failed: %v", err)
 				}
+				hosts, ports := ing.TCPAddresses()
+				if len(hosts) == 0 || len(ports) == 0 {
+					// This runs in a background goroutine, so do not fail the test here; retry on the next tick.
+					log.Warnf("skipping TCP requests: no TCP address found for ingress %s/%s in cluster %s",
+						ing.Namespace(), ing.ServiceName(), ing.Cluster().Name())
+					continue
+				}
+				host := hosts[0]
+				port := ports[0]
 				_, err = ing.Call(echo.CallOptions{
 					Port: echo.Port{
 						Protocol:    protocol.TCP,
